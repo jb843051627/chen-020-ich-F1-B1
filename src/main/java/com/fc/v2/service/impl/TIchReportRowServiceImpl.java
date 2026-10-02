@@ -39,26 +39,61 @@ public class TIchReportRowServiceImpl implements ITIchReportRowService {
     }
 
     @Override
+    @org.springframework.transaction.annotation.Transactional(
+            rollbackFor = java.lang.Exception.class)
     public int submitBatch(String batchNo, List<TIchReportRow> rows) {
-        // 一报一个批号，进门就定死，以首行带的号为准
-        String no = rows.get(0).getBatchNo();
-        // 整批先过一遍：只要有一条不合法，这一整批就不落库
-        for (TIchReportRow r : rows) {
-            if (invalidReason(r) != null) {
-                return 0;
-            }
+        // 空批次：没有东西可核，按 0 行接收，不插任何库（含 null 入参，兜底防 NPE/越界）
+        if (rows == null || rows.isEmpty()) {
+            return 0;
         }
+        // 批号是把成功行、失败行归到同一本账的唯一线索；缺号整批不收
+        if (isBlank(batchNo)) {
+            return 0;
+        }
+        // 单批行数硬上限：超限整批不入库，返回 -1 由调用方改走拆分，绝不"来多少收多少"
+        if (rows.size() > MAX_ROWS) {
+            note(batchNo, "超过单批上限 " + MAX_ROWS + " 行，整批拒收（实际 " + rows.size() + " 行）");
+            return -1;
+        }
+        // 重发幂等：同一批号只要落过库（成功或失败都算），直接回放上次成功行数，绝不再插第二份
+        if (countBatch(batchNo) > 0) {
+            int accepted = countAccepted(batchNo);
+            note(batchNo, "批次重复提交，按已接收 " + accepted + " 行幂等返回");
+            return accepted;
+        }
+
+        // 批号以入参为唯一口径，行内自带批号一律不采信，保证写入口/读出口前后同源
+        String no = batchNo.trim();
+
+        // 去重全批只认一把尺：(批号, 明细码)。先并入该批存量已落的码，再逐行占码，
+        // 同一码只收第一行，其余记失败——存量与本批口径一致。
+        java.util.Set<String> takenCodes = existingCodes(no);
+        // 行号也全批共用一个已用池：成功行、失败行一起归一，互不撞号、不覆盖原报行次
+        java.util.Set<Integer> usedRowNos = new java.util.HashSet<Integer>();
+
         int ok = 0;
-        int seq = 0;
+        int position = 0;
         for (TIchReportRow r : rows) {
             if (r == null) {
+                // 空位不是一行数据，跳过且不占行号、不计数
                 continue;
             }
-            seq++;
-            markOk(r, no, seq);
-            ok++;
+            position++;
+            int rowNo = normalizeRowNo(r, usedRowNos, position);
+            String reason = invalidReason(r);
+            if (reason == null && !takenCodes.add(r.getItemCode().trim())) {
+                reason = "批次内明细码重复：" + r.getItemCode().trim();
+            }
+            if (reason != null) {
+                // 非法行进失败明细：状态置 2、原因写备注、原报行号保留，成功行照常入库
+                markFail(r, no, rowNo, reason);
+            } else {
+                markOk(r, no, rowNo);
+                ok++;
+            }
         }
-        note(no, "提交完成：成功 " + ok + " 行");
+        int total = position;
+        note(no, "提交完成：成功 " + ok + " 行，失败 " + (total - ok) + " 行");
         return ok;
     }
 
@@ -91,6 +126,36 @@ public class TIchReportRowServiceImpl implements ITIchReportRowService {
         List<TIchReportRow> exist = this.ichReportRowMapper.selectList(
                 new QueryWrapper<TIchReportRow>().eq("batch_no", batchNo));
         return exist == null ? 0 : exist.size();
+    }
+
+    /** 该批已接收（成功）行数：重发命中幂等时原样回放，口径与 submitBatch 返回值一致 */
+    private int countAccepted(String batchNo) {
+        List<TIchReportRow> accepted = this.ichReportRowMapper.selectList(new QueryWrapper<TIchReportRow>()
+                .eq("batch_no", batchNo)
+                .eq("status", STATUS_OK)
+                .eq("del_flag", 0));
+        return accepted == null ? 0 : accepted.size();
+    }
+
+    /**
+     * 该批在库里已占用的明细码（存量并入时的去重底盘）。
+     * 与批内逐行占码共用同一把尺：trim 后的 (批号, 明细码)，保证存量与本批一致。
+     */
+    private java.util.Set<String> existingCodes(String batchNo) {
+        List<TIchReportRow> exist = this.ichReportRowMapper.selectList(new QueryWrapper<TIchReportRow>()
+                .select("item_code")
+                .eq("batch_no", batchNo)
+                .eq("del_flag", 0));
+        java.util.Set<String> codes = new java.util.HashSet<String>();
+        if (exist == null) {
+            return codes;
+        }
+        for (TIchReportRow r : exist) {
+            if (!isBlank(r.getItemCode())) {
+                codes.add(r.getItemCode().trim());
+            }
+        }
+        return codes;
     }
 
     /** 空串判定：批次号/明细码的纯空白串按"缺失"处理 */
